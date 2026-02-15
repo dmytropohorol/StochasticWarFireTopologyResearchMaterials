@@ -1,0 +1,2 @@
+latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,satellite,instrument,confidence,version,bright_ti5,frp,daynight,type,wind_speed_10m_mean,wind_direction_10m_dominant
+47.87531,35.16188,296.23,0.33,0.55,01/01/2019,33,N20,VIIRS,n,2,264.58,0.67,N,2,7.4,159
