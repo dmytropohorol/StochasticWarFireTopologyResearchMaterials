@@ -8,7 +8,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # --- CONFIGURATION ---
-INPUT_FILE_NAME = 'viirs-jpss1_Ukraine_during_war_only_high_confidence'
+INPUT_FILE_NAME = 'viirs_api_call_test'
+INPUT_FILE_FOLDER = f'data/api_test'
 CHUNK_SIZE = 100  # Number of coordinates per API call
 
 # --- SETUP ROBUST SESSION ---
@@ -22,7 +23,7 @@ retries = Retry(
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 # --- PREPARE DATA ---
-data_frame = pd.read_csv(f'data/{INPUT_FILE_NAME}.csv')
+data_frame = pd.read_csv(f'{INPUT_FILE_FOLDER}/{INPUT_FILE_NAME}.csv')
 
 # Ensure valid date format for grouping
 # (This creates a helper column solely for grouping purposes)
@@ -102,9 +103,11 @@ try:
 except KeyboardInterrupt:
     print("\n Script stopped by user! Saving progress...")
 
-    os.makedirs("data/backup", exist_ok=True)
+    data_frame.drop(columns=['grouping_date'], inplace=True)
+
+    os.makedirs(f"{INPUT_FILE_FOLDER}/backup", exist_ok=True)
     current_timesptamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file = f'data/backup/{INPUT_FILE_NAME}_{current_timesptamp}.csv'
+    file = f'{INPUT_FILE_FOLDER}/backup/{INPUT_FILE_NAME}_{current_timesptamp}.csv'
 
     data_frame.to_csv(file, index=False)
 
@@ -115,8 +118,8 @@ except KeyboardInterrupt:
 # --- CLEANUP AND SAVE ---
 data_frame.drop(columns=['grouping_date'], inplace=True)
 
-os.makedirs("data/generated", exist_ok=True)
+os.makedirs(f"{INPUT_FILE_FOLDER}/generated", exist_ok=True)
 current_timesptamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-data_frame.to_csv(f'data/generated/{INPUT_FILE_NAME}_{current_timesptamp}.csv', index=False)
+data_frame.to_csv(f'{INPUT_FILE_FOLDER}/generated/{INPUT_FILE_NAME}_{current_timesptamp}.csv', index=False)
 
 print("Processing complete.")

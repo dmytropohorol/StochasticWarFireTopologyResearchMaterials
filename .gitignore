@@ -207,5 +207,5 @@ marimo/_lsp/
 __marimo__/
 
 # Generated and backup files
-data/generated
-data/backup
+**/generated/**
+**/backup/**
