@@ -8,8 +8,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # --- CONFIGURATION ---
-INPUT_FILE_NAME = 'viirs_api_call_test'
-INPUT_FILE_FOLDER = f'data/api_test'
+INPUT_FILE_FOLDER = 'data/custom_pre_war'
+INPUT_FILE_NAME = 'viirs-jpss1_Ukraine_pre_war_only_high_confidence'
 CHUNK_SIZE = 100  # Number of coordinates per API call
 
 # --- SETUP ROBUST SESSION ---
@@ -22,7 +22,7 @@ retries = Retry(
 )
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# --- PREPARE DATA ---
+# --- PREPARE DATA ---  
 data_frame = pd.read_csv(f'{INPUT_FILE_FOLDER}/{INPUT_FILE_NAME}.csv')
 
 # Ensure valid date format for grouping
@@ -97,9 +97,7 @@ try:
                 
             except Exception as e:
                 print(f"FAILED: {date_str} batch. Error: {e}")
-
-            # If you are using free version, 10 seconds delay is optimal
-            time.sleep(10)
+                
 except KeyboardInterrupt:
     print("\n Script stopped by user! Saving progress...")
 
