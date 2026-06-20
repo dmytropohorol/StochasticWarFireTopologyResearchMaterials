@@ -8,116 +8,121 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # --- CONFIGURATION ---
-INPUT_FILE_FOLDER = 'data/custom_pre_war'
-INPUT_FILE_NAME = 'viirs-jpss1_Ukraine_pre_war_only_high_confidence'
-CHUNK_SIZE = 100  # Number of coordinates per API call
+INPUT_FILE_FOLDER = 'data/viirs-jpss1/AllCountries'
+INPUT_FILE_NAME = 'viirs-jpss1_2018-2024_AllCountries3iter'
+CHUNK_SIZE = 50
+
+HOURLY_VARIABLES = [
+    "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
+    "soil_moisture_0_to_7cm", "relative_humidity_2m", "cloud_cover",
+    "temperature_2m", "vapour_pressure_deficit", "precipitation"
+]
 
 # --- SETUP ROBUST SESSION ---
 session = requests.Session()
 retries = Retry(
-    total=3,                # Try 3 times total
-    backoff_factor=3,       # Wait 3s, then 9s, then 27s between retries
-    status_forcelist=[429, 500, 502, 503, 504], # Retry on these errors
-    allowed_methods=["GET"]
+    total=6,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"] 
 )
 session.mount('https://', HTTPAdapter(max_retries=retries))
+
+# --- HELPER FUNCTION FOR TIME ROUNDING ---
+def calculate_target_time(row):
+    acq_time = row['acq_time']
+    if pd.isna(acq_time): 
+        return f"{row['grouping_date']}T12:00"
+        
+    val = int(acq_time)
+    hours = val // 100
+    minutes = val % 100
+    
+    if minutes > 30:
+        hours += 1
+        
+    if hours >= 24:
+        hours = 23
+        
+    return f"{row['grouping_date']}T{hours:02d}:00"
+
 
 # --- PREPARE DATA ---  
 data_frame = pd.read_csv(f'{INPUT_FILE_FOLDER}/{INPUT_FILE_NAME}.csv')
 
-# Ensure valid date format for grouping
-# (This creates a helper column solely for grouping purposes)
-# DO NOT TRUST MICROSOFT EXCEL. It shows grouping_date the same as acq_date, but they are not the same.
 data_frame['grouping_date'] = pd.to_datetime(data_frame['acq_date'], dayfirst=True).dt.strftime('%Y-%m-%d')
+data_frame['target_time_str'] = data_frame.apply(calculate_target_time, axis=1)
 
-# Prepare empty columns
-data_frame['wind_speed_10m_mean'] = None
-data_frame['wind_direction_10m_dominant'] = None
+for var in HOURLY_VARIABLES:
+    data_frame[var] = None
 
-# --- PROCESS BY DATE ---
-# We group by the formatted date string so all rows for "2022-01-01" stay together
-grouped = data_frame.groupby('grouping_date')
+print(f"Loaded {len(data_frame)} rows. Grouping by day and processing...")
 
-print(f"Found {len(grouped)} unique days to process.")
+# --- SETUP LIVE OUTPUT FILE ---
+os.makedirs(f"{INPUT_FILE_FOLDER}/generated", exist_ok=True)
+current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+LIVE_OUTPUT_FILE = f'{INPUT_FILE_FOLDER}/generated/{INPUT_FILE_NAME}_LIVE_{current_timestamp}.csv'
+print(f"Live data will be constantly written to: {LIVE_OUTPUT_FILE}")
 
 url = "https://archive-api.open-meteo.com/v1/archive"
+grouped_by_date = data_frame.groupby('grouping_date')
+total_processed = 0
+
 try:
-    for date_str, group in grouped:
-        # 'group' is a mini-dataframe containing ALL rows for this specific date
+    for date_str, group in grouped_by_date:
         
-        # We slice this day's group into smaller chunks (e.g., 50 rows)
-        # to avoid making the API URL too long
         for i in range(0, len(group), CHUNK_SIZE):
             chunk = group.iloc[i : i + CHUNK_SIZE]
             
-            # Create comma-separated lists of lat/lon
-            lat_str = ",".join(chunk['latitude'].astype(str))
-            lon_str = ",".join(chunk['longitude'].astype(str))
+            lat_str = ",".join(chunk['latitude'].astype(str).tolist())
+            lon_str = ",".join(chunk['longitude'].astype(str).tolist())
+            hourly_str = ",".join(HOURLY_VARIABLES)
             
             params = {
                 "latitude": lat_str,
                 "longitude": lon_str,
                 "start_date": date_str,
                 "end_date": date_str,
-                "daily": "wind_speed_10m_mean,wind_direction_10m_dominant",
-                "timezone": "Africa/Cairo"
+                "hourly": hourly_str,
+                "timezone": "GMT"
             }
             
             try:
-                # timeout=20 means "give up if server doesn't respond in 20 seconds"
-                # The session.get() will automatically retry if it times out.
-                r = session.get(url, params=params, timeout=20)
+                r = session.get(url, params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 
-                # The API returns a LIST of results if multiple coords are sent.
-                # Usually data is a list of dicts, or a dict containing lists.
-                # Open-Meteo returns a LIST of objects when multiple coords are used.
-                if isinstance(data, list):
-                    results = data
-                else:
-                    # If only 1 coordinate was sent, it returns a single dict, wrap in list
-                    results = [data]
-                    
-                # Map results back to the dataframe
-                # The API returns results in the same order we sent the coordinates
-                current_res_idx = 0
-                for index, row in chunk.iterrows():
-                    daily = results[current_res_idx].get('daily', {})
-                    
-                    ws = daily.get('wind_speed_10m_mean', [None])[0]
-                    wd = daily.get('wind_direction_10m_dominant', [None])[0]
-                    
-                    data_frame.at[index, 'wind_speed_10m_mean'] = ws
-                    data_frame.at[index, 'wind_direction_10m_dominant'] = wd
-                    
-                    current_res_idx += 1
+                results = data if isinstance(data, list) else [data]
                 
-                print(f"Success: {date_str} (Batch of {len(chunk)} rows)")
+                for (index, row), res in zip(chunk.iterrows(), results):
+                    target_time_str = row['target_time_str']
+                    hourly_data = res.get('hourly', {})
+                    times = hourly_data.get('time', [])
+                    
+                    try:
+                        date_idx = times.index(target_time_str)
+                        for var in HOURLY_VARIABLES:
+                            data_frame.at[index, var] = hourly_data.get(var, [])[date_idx]
+                            
+                    except (ValueError, IndexError):
+                        pass
                 
+                total_processed += len(chunk)
+                print(f"Success: {total_processed}/{len(data_frame)} processed | Date: {date_str} | Chunk Size: {len(chunk)}", flush=True)
+                
+                # Extract only the 50 rows we just finished modifying
+                finished_chunk = data_frame.loc[chunk.index].drop(columns=['grouping_date', 'target_time_str'], errors='ignore')
+                
+                # Append them to the live CSV. If the file doesn't exist yet, it writes the column headers.
+                finished_chunk.to_csv(LIVE_OUTPUT_FILE, mode='a', header=not os.path.exists(LIVE_OUTPUT_FILE), index=False)
+
+                time.sleep(5)
+
             except Exception as e:
-                print(f"FAILED: {date_str} batch. Error: {e}")
+                print(f"FAILED on Date: {date_str}. Error: {e}")
                 
 except KeyboardInterrupt:
-    print("\n Script stopped by user! Saving progress...")
-
-    data_frame.drop(columns=['grouping_date'], inplace=True)
-
-    os.makedirs(f"{INPUT_FILE_FOLDER}/backup", exist_ok=True)
-    current_timesptamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file = f'{INPUT_FILE_FOLDER}/backup/{INPUT_FILE_NAME}_{current_timesptamp}.csv'
-
-    data_frame.to_csv(file, index=False)
-
-    print(f"Progress saved to {file}")
-
+    print("\n Script stopped by user! The Live CSV is already safely on your hard drive.")
     sys.exit()
 
-# --- CLEANUP AND SAVE ---
-data_frame.drop(columns=['grouping_date'], inplace=True)
-
-os.makedirs(f"{INPUT_FILE_FOLDER}/generated", exist_ok=True)
-current_timesptamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-data_frame.to_csv(f'{INPUT_FILE_FOLDER}/generated/{INPUT_FILE_NAME}_{current_timesptamp}.csv', index=False)
-
-print("Processing complete.")
+print(f"Processing complete. Final data is ready at {LIVE_OUTPUT_FILE}")

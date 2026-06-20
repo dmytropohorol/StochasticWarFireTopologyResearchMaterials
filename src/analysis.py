@@ -3,54 +3,35 @@
 # This cell will fail if libraries listed below is not downloaded
 # on your local machine. Check the documentation for the assistance.
 
-# Powerful data structures for data analysis, time series, and statistics
 import pandas as pd
-
-# Geographic pandas extensions
 import geopandas as gpd
-
-# Python plotting package
 import matplotlib.pyplot as plt
-
-# Python package for creating and manipulating graphs and networks
-import networkx as nx
-
-# Fundamental package for array computing in Python
 import numpy as np
-
-# Fundamental algorithms for scientific computing in Python
-from scipy.spatial import cKDTree
-
-# The Gudhi library is an open source library for 
-# Computational Topology and Topological Data Analysis (TDA).
-import gudhi
-
-# We need a clustering algorithm to group individual dots into "events"
-from sklearn.cluster import DBSCAN, HDBSCAN
-from sklearn import metrics
-
+from sklearn.cluster import HDBSCAN
+from sklearn.neighbors import KDTree
 import seaborn as sns
 import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.windows import from_bounds
-
+import numpy as np
+import pandas as pd
+import xarray as xr
 print("Great success")
+
 
 
 # %% [CELL 2] 
 # --- LOAD & PROJECT DATA ---
 
+RAW_HOTSPOT_DATA = "../data/viirs-jpss1/AllCountries/viirs-jpss1_2018-2024_AllCountries11.csv" 
+
 # CRS: EPSG:3034 - ETRS89-extended / LCC Europe
 # We are not using EPSG:3035 because its scope is statistical analysis,
 # and we are not using EPSG:25832 because it's used for conformal 
 # mapping at scales larger than 1:500,000
-METRIC_CRS = "EPSG:3035" #TODO: test compared to EPSG:32636
-
-DATA_PATH = "../data/viirs-jpss1/Ukraine/viirs-jpss1_2018-2024_Ukraine_formatted.csv" 
+METRIC_CRS = "EPSG:3035"
 
 # Reading a csv file
 data_frame = pd.read_csv(
-    DATA_PATH, 
+    RAW_HOTSPOT_DATA, 
     low_memory=True, 
     parse_dates=['acq_date'],
     dayfirst=True
@@ -78,8 +59,6 @@ data_frame['y'] = geo_data_frame_meters.geometry.y
 
 # Freeing the memory (csv could be extreamly big, so we need to free arrays explicitly)
 del geo_data_frame, geo_data_frame_meters, geometry
-data_frame = data_frame.drop('latitude', axis=1)
-data_frame = data_frame.drop('longitude', axis=1)
 
 print("Great success")
 
@@ -109,11 +88,147 @@ data_frame = data_frame.drop('land_use_code', axis=1)
 print("Great success")
 
 
+
 # %% [CELL 4] 
 # --- DATA INTEGRITY AND ANALYSIS ---
 
+# For data clusterization
+SPATIAL_EPS = 5000  # meters
+DATE_EPS = 3        # days
+
+
+# --- 3D SPATIOTEMPORAL CLUSTERING ---
+
+# HDBSCAN uses an isotropic distance metric (it treats all axes equally).
+# To prevent time from dominating the spatial coordinates, we must scale 
+# the temporal axis (Z) so that DATE_EPS mathematically equals SPATIAL_EPS.
+
+# Convert absolute datetime to continuous days elapsed since the first detection
+time_delta = data_frame['acq_date'] - data_frame['acq_date'].min()
+data_frame['days_since_start'] = time_delta.dt.total_seconds() / 86400.0  # 86400 seconds in a day
+
+# Scale the time axis: 1 unit of Z will now equal 1 unit of X/Y space
+time_scale_factor = SPATIAL_EPS / DATE_EPS
+data_frame['z_time'] = data_frame['days_since_start'] * time_scale_factor
+data_frame = data_frame.drop('days_since_start', axis=1)
+
+X_cluster = data_frame[['x', 'y', 'z_time']].to_numpy()
+
+print("Running 3D Spatiotemporal Pass for Clusters...")
+# Run HDBSCAN on the normalized 3D (X, Y, Scaled_Time) matrix
+hdb = HDBSCAN(
+    min_cluster_size=5, 
+    min_samples=None, 
+    copy=True, 
+    n_jobs=-1
+).fit(X_cluster)
+
+# Force a flat cluster extraction using the spatial epsilon cut distance
+cluster_labels = hdb.dbscan_clustering(cut_distance=SPATIAL_EPS)
+probabilities = hdb.probabilities_
+
+# Save the 3D Time-Cluster labels to the dataframe for later feature extraction
+data_frame['cluster_id'] = cluster_labels
+
+
+# --- CYCLICAL SEASONALITY ---
+# Map Day of Year to a 2D circle to avoid the Dec 31st/Jan 1st boundary gap
+days_in_year = 365.25
+day_of_year = data_frame['acq_date'].dt.dayofyear
+data_frame['day_sin'] = np.sin(2 * np.pi * day_of_year / days_in_year)
+data_frame['day_cos'] = np.cos(2 * np.pi * day_of_year / days_in_year)
+
+
+# --- TIME-CLUSTER METRICS ---
+# We ignore noise points (-1) when calculating cluster aggregates
+valid_time_clusters = data_frame[data_frame['cluster_id'] != -1]
+
+# cluster_point_count (Intensity)
+tc_counts = valid_time_clusters.groupby('cluster_id').size()
+data_frame['cluster_point_count'] = data_frame['cluster_id'].map(tc_counts).fillna(1)
+
+# cluster_duration_days (Duration)
+tc_duration = valid_time_clusters.groupby('cluster_id')['acq_date'].agg(
+    lambda x: (x.max() - x.min()).total_seconds() / 86400.0
+)
+data_frame['cluster_duration_days'] = data_frame['cluster_id'].map(tc_duration).fillna(0)
+
+
+# --- CREATE SPATIAL MEGACLUSTERS ---
+# We must collapse the time axis to find the 2D spatial boundaries
+X_megacluster = data_frame[['x', 'y']].to_numpy()
+
+print("Running 2D Spatial Pass for Megaclusters...")
+hdb_spatial = hdb = HDBSCAN(
+    min_cluster_size=5, 
+    min_samples=None, 
+    copy=True, 
+    n_jobs=-1
+).fit(X_megacluster)
+megacluster_labels = hdb_spatial.labels_
+data_frame['mega_cluster_id'] = megacluster_labels
+valid_megaclusters = data_frame[data_frame['mega_cluster_id'] != -1]
+
+
+# --- MEGACLUSTER METRICS ---
+# megacluster_point_count (Historical Volume)
+mc_counts = valid_megaclusters.groupby('mega_cluster_id').size()
+data_frame['megacluster_point_count'] = data_frame['mega_cluster_id'].map(mc_counts).fillna(1)
+
+# megacluster_cluster_count (Repeated Strikes)
+# How many unique, valid 3D time-clusters happened inside this 2D boundary?
+mc_repeats = valid_megaclusters[valid_megaclusters['cluster_id'] != -1].groupby('mega_cluster_id')['cluster_id'].nunique()
+data_frame['megacluster_cluster_count'] = data_frame['mega_cluster_id'].map(mc_repeats).fillna(1)
+
+
+# --- CIRCULAR VARIANCE (Agriculture vs Shelling) ---
+def calc_circular_variance(dates):
+    doy = dates.dt.dayofyear
+    angles = 2 * np.pi * doy / days_in_year
+    # Calculate Mean Resultant Vector Length (R)
+    R = np.sqrt(np.sum(np.cos(angles))**2 + np.sum(np.sin(angles))**2) / len(angles)
+    return 1.0 - R
+
+print("Calculating Circular Variance...")
+mc_circ_var = valid_megaclusters.groupby('mega_cluster_id')['acq_date'].apply(calc_circular_variance)
+# Fill missing or noise points with 0 (treating them as singular events)
+data_frame['circular_variance'] = data_frame['mega_cluster_id'].map(mc_circ_var).fillna(0)
+
+
+# --- MEGACLUSTER EXPANSION RATIO (Trench Line Metric) ---
+print("Calculating Spatial Density Gradient via KDTree...")
+RADIUS_3KM = 3000 
+RADIUS_6KM = 12000
+
+tree = KDTree(X_megacluster)
+
+# count_only=True runs at C-speed, avoiding memory overhead of returning actual indices
+counts_3km = tree.query_radius(X_megacluster, r=RADIUS_3KM, count_only=True)
+counts_6km = tree.query_radius(X_megacluster, r=RADIUS_6KM, count_only=True)
+
+# Calculate ratio. np.maximum prevents division by zero, 
+# though a point is always its own neighbor so counts_3km >= 1
+data_frame['megacluster_expansion_ratio'] = counts_6km / np.maximum(counts_3km, 1)
+
+
+# --- Linear Analysis ---
+# TODO: For each cluster check the wind data and find the angle compared to
+# eigen value of cluster
+
+# --- Spcial Velocity Analysis ---
+# TODO: For each cluster, megacluster and bigger clusters detect how fire moves
+
+
+print("Feature Extraction Complete.")
+
+
+
+# %% [CELL 5]
+# --- DATA INTEGRITY AND ANALYSIS ---
+
+
 # Checking if data is valid
-plt.figure(figsize=(12, 6))
+plt.figure(figsize=(12.8, 7.2), dpi=300)
 sns.heatmap(data_frame.isnull(), cbar=False, cmap='viridis', yticklabels=False)
 plt.title('Heatmap of Missing Values in Dataset')
 plt.show()
@@ -124,7 +239,7 @@ plt.suptitle('Histograms of All Features', fontsize=16)
 plt.tight_layout()
 plt.show()
 
-plt.figure(figsize=(10, 6))
+plt.figure(figsize=(12.8, 7.2), dpi=300)
 # countplot is better for categorical data like 'land_use'
 sns.countplot(
     data=data_frame, 
@@ -141,121 +256,194 @@ plt.ylabel('Land Use Type')
 plt.grid(axis='x', linestyle='--', alpha=0.7)
 plt.show()
 
+def visualize_hdbscan(labels):
+    plt.figure(figsize=(12.8, 7.2), dpi=300)
+    unique_labels = set(labels)
+    colors = [plt.cm.Spectral(each) for each in np.linspace(0, 1, len(unique_labels))]
+    for k, col in zip(unique_labels, colors):
+        if k == -1:
+            # Black used for noise.
+            col = [0, 0, 0, 1]
+            # Set zorder low so noise stays in the background
+            layer = 1 
+        else:
+            # Set zorder higher so cluster points plot on top of noise
+            layer = 2 
+
+        # Mask for all members of the current class
+        class_member_mask = (labels == k)
+        xy = X_cluster[class_member_mask]
+
+        if k == -1:
+            # Plot noise all at once exactly as you had it
+            plt.plot(
+                xy[:, 0],
+                xy[:, 1],
+                marker=".",
+                linestyle="none",    
+                color=tuple(col),    
+                markersize=1,
+                zorder=layer         
+            )
+        else:
+            cluster_probs = probabilities[class_member_mask]
+            
+            rgba_colors = np.zeros((len(cluster_probs), 4))
+            rgba_colors[:, :3] = col[:3]      # Base RGB color
+            rgba_colors[:, 3] = cluster_probs # Alpha = Probability (Edge points will fade out)
+
+            plt.scatter(
+                xy[:, 0],
+                xy[:, 1],
+                marker=".",
+                c=rgba_colors,
+                s=1, # Equivalent to markersize=1
+                zorder=layer
+            )
+
+    plt.show()
+
+visualize_hdbscan(cluster_labels)
+
+visualize_hdbscan(megacluster_labels)
+
 print("Great success")
 
 
 
-# %% [CELL 5] 
-# --- DATA CLUSTERIZATION ---
+# %% [CELL 8] 
+# --- MACHINE LEARNING: ANOMALY DETECTION ---
 
-SPATIAL_EPS = 6000  # meters
-DATE_EPS = 3        # days
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
-# Because epsilon value in DBSCAN is the same for all axises, 
-# we need to transform the date value
+print("Preparing features for Machine Learning...")
 
-# Creating a new column for 3d axis — time. We need to filter not only by the position
-# of the hotspot, but the time it happend.
-time_delta = data_frame['acq_date'] - data_frame['acq_date'].min()
-data_frame['days_since_start'] = time_delta.dt.total_seconds() / (24 * 60 * 60)
+# 1. Define the exact feature vector
+# CRITICAL: Do NOT include x, y, time_cluster_id, mega_cluster_id, or acq_date.
+ml_features = [
+    'cluster_point_count', 
+    'cluster_duration_days', 
+    'megacluster_point_count', 
+    'megacluster_cluster_count', 
+    'megacluster_expansion_ratio', 
+    'circular_variance', 
+    'day_sin', 
+    'day_cos',
+    'bright_ti5',
+    'frp',
+    'temperature_2m_C',
+    'total_precip_m',
+    'soil_moisture',
+    'wind_speed_m_s',
+    'wind_direction_deg',
+    'wind_gust',
+]
 
-# Based on our spatial epsilon we need to change the date epsilon
-time_scale_factor = SPATIAL_EPS / DATE_EPS
-data_frame['z_time'] = data_frame['days_since_start'] * time_scale_factor
-data_frame = data_frame.drop('days_since_start', axis=1)
+# We will ignore 'land_use' for the first pass to avoid categorical encoding complexities.
+# We only want to analyze data that survived the noise filter for feature generation
+# (Though noise points are now size=1, they are valid events).
+ml_data = data_frame.copy()
 
-X = data_frame[['x', 'y', 'z_time']].to_numpy()
-hdb = HDBSCAN(
-    min_cluster_size=5, 
-    min_samples=None, 
-    copy=True, 
+# 2. Split the dataset temporally (Peacetime vs War)
+# We train ONLY on peacetime data to learn the baseline.
+PEACETIME_END = '2022-02-24'
+peacetime_mask = ml_data['acq_date'] < PEACETIME_END
+
+
+#data_frame = data_frame.drop('acq_date', axis=1)
+
+
+
+train_data = ml_data[peacetime_mask][ml_features]
+test_data = ml_data[~peacetime_mask][ml_features]
+
+print(f"Training on {len(train_data)} peacetime events.")
+print(f"Testing on {len(test_data)} wartime events.")
+
+# 3. Scale the features
+# Even though tree-based models handle unscaled data okay, scaling ensures
+# features like cluster_point_count (1000s) don't overshadow circular_variance (0-1).
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(train_data)
+X_test_scaled = scaler.transform(test_data)
+
+# 4. Train the Isolation Forest
+print("Training Isolation Forest on Peacetime Baseline...")
+iso_forest = IsolationForest(
+    n_estimators=15000,        # Number of trees
+    max_samples='auto',      
+    contamination=0.05,      # Assume 2% of peacetime fires were genuine outliers
+    random_state=42,
     n_jobs=-1
-).fit(X)
+)
+iso_forest.fit(X_train_scaled)
 
-labels = hdb.dbscan_clustering(cut_distance=SPATIAL_EPS) # hdb.labels_
-probabilities = hdb.probabilities_
+# 5. Predict on the War-Time Data
+print("Scoring Wartime Data...")
+# Predict returns 1 (normal) or -1 (anomaly)
+predictions = iso_forest.predict(X_test_scaled)
+# Score samples returns a continuous score. Lower score = More Anomalous.
+anomaly_scores = iso_forest.score_samples(X_test_scaled) 
 
-n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
-n_noise_ = list(labels).count(-1)
-print("Estimated number of clusters: %d" % n_clusters_)
-print("Estimated number of noise points: %d" % n_noise_)
-print(f"Silhouette Coefficient: {metrics.silhouette_score(X, labels):.3f}")
+# Map results back to the testing dataframe
+results_df = ml_data[~peacetime_mask].copy()
+results_df['is_anomaly'] = predictions
+results_df['anomaly_score'] = anomaly_scores
 
-unique_labels = set(labels)
+print("Prediction Complete.")
 
-plt.figure(figsize=(12.8, 7.2), dpi=300) #TODO: Move to global config
-colors = [plt.cm.Spectral(each) for each in np.linspace(0, 1, len(unique_labels))]
-for k, col in zip(unique_labels, colors):
-    if k == -1:
-        # Black used for noise.
-        col = [0, 0, 0, 1]
-        # Set zorder low so noise stays in the background
-        layer = 1 
-    else:
-        # Set zorder higher so cluster points plot on top of noise
-        layer = 2 
 
-    # Mask for all members of the current class
-    class_member_mask = (labels == k)
-    xy = X[class_member_mask]
+# --- VISUALIZATION: DID IT GUESS CORRECTLY? ---
+print("Generating Anomaly Map...")
 
-    if k == -1:
-        # Plot noise all at once exactly as you had it
-        plt.plot(
-            xy[:, 0],
-            xy[:, 1],
-            marker=".",
-            linestyle="none",    
-            color=tuple(col),    
-            markersize=1,
-            zorder=layer         
-        )
-    else:
-        cluster_probs = probabilities[class_member_mask]
-        
-        rgba_colors = np.zeros((len(cluster_probs), 4))
-        rgba_colors[:, :3] = col[:3]      # Base RGB color
-        rgba_colors[:, 3] = cluster_probs # Alpha = Probability (Edge points will fade out)
+# We want to isolate the absolute most extreme anomalies (e.g., the bottom 5% of scores)
+threshold = results_df['anomaly_score'].quantile(0.1)
+extreme_anomalies = results_df[results_df['anomaly_score'] < threshold]
+normal_war_fires = results_df[results_df['anomaly_score'] >= threshold]
 
-        plt.scatter(
-            xy[:, 0],
-            xy[:, 1],
-            marker=".",
-            c=rgba_colors,
-            s=1, # Equivalent to markersize=1
-            zorder=layer
-        )
+plt.figure(figsize=(14, 10), dpi=300)
 
+# Plot the "normal" wartime fires (agriculture, natural) in the background
+plt.scatter(
+    normal_war_fires['x'], 
+    normal_war_fires['y'], 
+    c='lightgray', 
+    s=2, 
+    alpha=0.5, 
+    label='Classified: Normal Behavior'
+)
+
+# Plot the extreme anomalies on top
+plt.scatter(
+    extreme_anomalies['x'], 
+    extreme_anomalies['y'], 
+    c='red', 
+    s=10, 
+    alpha=0.8, 
+    label='Classified: Extreme Anomaly (War)'
+)
+
+plt.title('Isolation Forest Predictions: Top 5% Spatiotemporal Anomalies', fontsize=16)
+plt.xlabel('X (Meters - EPSG:3035)')
+plt.ylabel('Y (Meters - EPSG:3035)')
+plt.legend(loc='upper left')
+plt.axis('equal') # Ensure the map isn't stretched
+plt.grid(True, linestyle='--', alpha=0.3)
 plt.show()
 
-print("Great success")
+# Print the stats of the worst anomalies
+print("\n--- Average Features of Extreme Anomalies vs Normal Fires ---")
+comparison = results_df.groupby(results_df['anomaly_score'] < threshold)[ml_features].mean().T
+comparison.columns = ['Normal', 'Anomaly']
+print(comparison.round(2))
 
 
-
-# %% [CELL 4] 
-
-# If a lot of points are located near the clusters, that is strange. x2 of radius i.e.
-# If i can somehow check Spatiometral Velocity of points not just of the cluster, but
-# the points around it too, i can theoretically detect if that fire is natural or not
-# or it was ignated. The reason is that if the fire happens, it should move under some
-# logic, and ignation should not appear kilometers away. In addition, it explains the
-# shelling problem. When shelling, bombs or etc, are left in the forest, OR is activelly
-# in use, it will make THE SAME hotspot activities. If for example
-
-
-
-# %% [CELL 4] 
-
-# Linearity analysis and Wind direction to linearity
-
-
-
-# %% [CELL 4] 
-
-# Final ML war-fires vs everything else distinguisher. 
-
-
-
-# %% [CELL 4] 
+# %% [CELL 9] 
 
 # Picture, stats, infographics etc generation
+
+# Get air quality and detect a shelling using it
+# Use deepstate to distinguish war-fires between everything else

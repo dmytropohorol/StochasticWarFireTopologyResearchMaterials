@@ -1,9 +1,12 @@
 pandas
 geopandas
 matplotlib
-networkx
+seaborn
 numpy
 scipy
-gudhi
-scikit-learn
-requests
+scikit-learn>=1.3.0
+earthengine-api
+rasterio
+xarray
+jupyterlab
+notebook

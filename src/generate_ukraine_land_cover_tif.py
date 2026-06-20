@@ -31,7 +31,7 @@ if not os.path.exists(RAW_TIFF):
 # --- REPROJECT & CROP ---
 print("Cropping & Reprojecting global TIFF to EPSG:3035...")
 with rasterio.open(RAW_TIFF) as src:
-    win = from_bounds(22.0, 44.0, 40.5, 52.5, src.transform)
+    win = from_bounds(22.0, 44.0, 41, 56, src.transform)
     win_transform = src.window_transform(win)
     
     dst_transform, w, h = calculate_default_transform(
